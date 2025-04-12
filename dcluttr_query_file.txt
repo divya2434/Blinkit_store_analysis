@@ -1,0 +1,118 @@
+WITH inventory_snapshots AS (
+    SELECT 
+        a.sku_id,
+        a.sku_name,
+        a.created_at,
+        a.brand_id,
+        a.brand,
+        a.image_url,
+        b.l1_category_id AS category_id,
+        b.l1_category AS category_name,
+        b.l2_category_id AS sub_category_id,
+        b.l2_category AS sub_category_name,
+        c.city_name,
+        a.store_id,
+        TRY_CAST(a.inventory AS INT) AS inventory,
+        TRY_CAST(a.selling_price AS FLOAT) AS selling_price,
+        TRY_CAST(a.mrp AS FLOAT) AS mrp,
+        ROW_NUMBER() OVER (PARTITION BY a.sku_id, c.city_name ORDER BY a.created_at ASC) AS rn_min,
+        ROW_NUMBER() OVER (PARTITION BY a.sku_id, c.city_name ORDER BY a.created_at DESC) AS rn_max
+    FROM BlinkitDB.dbo.all_blinkit_category_scraping_stream a
+    LEFT JOIN BlinkitDB.dbo.blinkit_categories b
+        ON a.l1_category_id = b.l1_category_id AND a.l2_category_id = b.l2_category_id
+    LEFT JOIN BlinkitDB.dbo.blinkit_city_map c
+        ON a.store_id = c.store_id
+),
+min_inventory AS (
+    SELECT sku_id, city_name, inventory AS inventory_min
+    FROM inventory_snapshots
+    WHERE rn_min = 1
+),
+max_inventory AS (
+    SELECT sku_id, city_name, inventory AS inventory_max
+    FROM inventory_snapshots
+    WHERE rn_max = 1
+),
+est_qty_sold_calc AS (
+    SELECT 
+        m.sku_id, m.city_name, 
+        (m.inventory_min - x.inventory_max) AS est_qty_sold
+    FROM min_inventory m
+    JOIN max_inventory x 
+        ON m.sku_id = x.sku_id AND m.city_name = x.city_name
+),
+mode_prices AS (
+    SELECT 
+        sku_id, city_name, 
+        selling_price, 
+        mrp,
+        ROW_NUMBER() OVER (PARTITION BY sku_id, city_name ORDER BY COUNT(*) DESC) AS rn
+    FROM inventory_snapshots
+    GROUP BY sku_id, city_name, selling_price, mrp
+),
+store_stats AS (
+    SELECT 
+        sku_id,
+        city_name,
+        COUNT(DISTINCT store_id) AS listed_ds_count,
+        COUNT(DISTINCT CASE WHEN inventory > 0 THEN store_id END) AS in_stock_ds_count
+    FROM inventory_snapshots
+    GROUP BY sku_id, city_name
+),
+total_ds_count AS (
+    SELECT COUNT(DISTINCT store_id) AS ds_count 
+    FROM BlinkitDB.dbo.all_blinkit_category_scraping_stream
+),
+final_data AS (
+    SELECT 
+        i.created_at AS date,
+        i.brand_id,
+        i.brand,
+        i.image_url,
+        i.city_name,
+        i.sku_id,
+        i.sku_name,
+        i.category_id,
+        i.category_name,
+        i.sub_category_id,
+        i.sub_category_name,
+        COALESCE(q.est_qty_sold, 0) AS est_qty_sold,
+        COALESCE(q.est_qty_sold, 0) * COALESCE(mp.selling_price, 0) AS est_sales_sp,
+        COALESCE(q.est_qty_sold, 0) * COALESCE(mp.mrp, 0) AS est_sales_mrp,
+        COALESCE(ss.listed_ds_count, 0) AS listed_ds_count,
+        tds.ds_count,
+        ROUND(CAST(COALESCE(ss.in_stock_ds_count, 0) AS FLOAT) / NULLIF(tds.ds_count, 0), 3) AS wt_osa,
+        ROUND(CAST(COALESCE(ss.in_stock_ds_count, 0) AS FLOAT) / NULLIF(ss.listed_ds_count, 0), 3) AS wt_osa_ls,
+        COALESCE(mp.mrp, 0) AS mrp,
+        COALESCE(mp.selling_price, 0) AS sp,
+        ROUND((COALESCE(mp.mrp, 0) - COALESCE(mp.selling_price, 0)) / NULLIF(COALESCE(mp.mrp, 0), 0), 3) AS discount
+    FROM inventory_snapshots i
+    LEFT JOIN est_qty_sold_calc q ON i.sku_id = q.sku_id AND i.city_name = q.city_name
+    LEFT JOIN mode_prices mp ON i.sku_id = mp.sku_id AND i.city_name = mp.city_name AND mp.rn = 1
+    LEFT JOIN store_stats ss ON i.sku_id = ss.sku_id AND i.city_name = ss.city_name
+    CROSS JOIN total_ds_count tds
+)
+SELECT DISTINCT 
+    date,
+    brand_id,
+    brand,
+    image_url,
+    city_name,
+    sku_id,
+    sku_name,
+    category_id,
+    category_name,
+    sub_category_id,
+    sub_category_name,
+    est_qty_sold,
+    est_sales_sp,
+    est_sales_mrp,
+    listed_ds_count,
+    ds_count,
+    wt_osa,
+    wt_osa_ls,
+    mrp,
+    sp,
+    discount
+FROM final_data;
+
